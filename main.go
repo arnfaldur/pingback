@@ -9,11 +9,10 @@ import (
 
 	"github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/prometheus-community/pro-bing"
+	probing "github.com/prometheus-community/pro-bing"
 )
 
 func main() {
-	// Parse command-line arguments
 	address := flag.String("address", "", "IP address or URL to ping")
 	interval := flag.Int("interval", 1000, "Ping interval in milliseconds")
 	flag.Parse()
@@ -31,42 +30,31 @@ func main() {
 	}
 }
 
-// Model represents the state of the application
 type model struct {
-	address  string
-	interval time.Duration
-	pinger   *probing.Pinger
-	err      error
-
-	latencyData []float64
-
+	address      string
+	interval     time.Duration
+	err          error
+	latencyData  []float64
 	streamLength int
-	// Streams for different timescales
-	stream1 []float64         // Raw latency data
-	stream2 [][]float64       // Aggregated data (32 points)
-	stream3 [][]float64       // Aggregated data (1024 points)
-	glyphs1 []string          // Glyphs for stream1
-	glyphs2 []string          // Glyphs for stream2
-	glyphs3 []string          // Glyphs for stream3
-	minLat  float64           // Minimum latency observed
-	maxLat  float64           // Maximum latency observed
+	stream1      []float64
+	minLat       float64
+	maxLat       float64
 }
 
 func initialModel(address string, interval time.Duration) model {
 	return model{
-		address:  address,
-		interval: interval,
-		minLat:   math.MaxFloat64,
-		maxLat:   0,
+		address:      address,
+		interval:     interval,
+		minLat:       math.MaxFloat64,
+		maxLat:       0,
+		streamLength: 80,
 	}
 }
 
-// Init initializes the model
 func (m model) Init() tea.Cmd {
 	return m.pingCmd()
 }
 
-// pingCmd pings the target address and returns a latencyMsg
 func (m model) pingCmd() tea.Cmd {
 	return func() tea.Msg {
 		pinger, err := probing.NewPinger(m.address)
@@ -75,7 +63,6 @@ func (m model) pingCmd() tea.Cmd {
 		}
 		pinger.Count = 1
 		pinger.Timeout = m.interval
-		// pinger.SetPrivileged(true)
 		err = pinger.Run()
 		if err != nil {
 			return errMsg{err}
@@ -89,17 +76,11 @@ func (m model) pingCmd() tea.Cmd {
 	}
 }
 
-// Messages used in the update function
 type (
-	latencyMsg struct {
-		latency float64
-	}
-	errMsg struct {
-		err error
-	}
+	latencyMsg struct{ latency float64 }
+	errMsg     struct{ err error }
 )
 
-// Update handles incoming messages and updates the model state
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case latencyMsg:
@@ -107,25 +88,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Tick(m.interval, func(t time.Time) tea.Msg {
 			return m.pingCmd()()
 		})
-
 	case errMsg:
 		m.err = msg.err
 		return m, tea.Quit
-
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" || msg.String() == "q" {
 			return m, tea.Quit
 		}
 	case tea.WindowSizeMsg:
 		m.streamLength = msg.Width
+		if m.streamLength > 65536 {
+			m.streamLength = 65536
+		}
 	}
-
 	return m, nil
 }
 
-// processLatency updates streams and glyphs based on the new latency data
 func (m *model) processLatency(latency float64) {
-	// Update min and max latency
 	if !math.IsNaN(latency) {
 		if latency < m.minLat {
 			m.minLat = latency
@@ -135,138 +114,153 @@ func (m *model) processLatency(latency float64) {
 		}
 	}
 
-	// Update latency data
 	m.latencyData = append(m.latencyData, latency)
+	if len(m.latencyData) > m.streamLength {
+		m.latencyData = m.latencyData[1:]
+	}
 
-	// Update stream1
 	m.stream1 = append(m.stream1, latency)
-	m.glyphs1 = append(m.glyphs1, m.latencyToGlyph(latency))
-	if len(m.glyphs1) > m.streamLength {
-		m.glyphs1 = m.glyphs1[1:]
-	}
-
-	// Update stream2
-	if len(m.stream1)%32 == 0 {
-		agg := m.stream1[len(m.stream1)-32:]
-		m.stream2 = append(m.stream2, agg)
-		m.glyphs2 = append(m.glyphs2, m.aggregateToGlyph(agg))
-		if len(m.glyphs2) > m.streamLength {
-			m.glyphs2 = m.glyphs2[1:]
-		}
-	}
-
-	// Update stream3
-	if len(m.stream1)%1024 == 0 {
-		agg := m.stream1[len(m.stream1)-1024:]
-		m.stream3 = append(m.stream3, agg)
-		m.glyphs3 = append(m.glyphs3, m.aggregateToGlyph(agg))
-		if len(m.glyphs3) > m.streamLength {
-			m.glyphs3 = m.glyphs3[1:]
-		}
+	if len(m.stream1) > m.streamLength {
+		m.stream1 = m.stream1[1:]
 	}
 }
 
-// View renders the UI
 func (m model) View() string {
 	if m.err != nil {
 		return fmt.Sprintf("Error: %v\n", m.err)
 	}
 
-	header := fmt.Sprintf("Pinging %s every %v ms\n", m.address, m.interval.Milliseconds())
+	header := fmt.Sprintf("Pinging %s every %v ms\n",
+		m.address, m.interval.Milliseconds())
 	gradient := m.renderGradient()
 
+	stream1 := m.renderStream(m.stream1)
+	stream2 := m.renderAggregateStream(32)
+	stream3 := m.renderAggregateStream(1024)
+
 	streams := lipgloss.JoinVertical(lipgloss.Left,
-		"Stream 1 (Raw Data):",
-		m.renderGlyphs(m.glyphs1),
-		"Stream 2 (Aggregated 32):",
-		m.renderGlyphs(m.glyphs2),
-		"Stream 3 (Aggregated 1024):",
-		m.renderGlyphs(m.glyphs3),
+		"Stream 1 (Raw Data):", stream1,
+		"Stream 2 (Aggregated 32):", stream2,
+		"Stream 3 (Aggregated 1024):", stream3,
 	)
 
-	return lipgloss.JoinVertical(lipgloss.Left, header, streams, "Latency Gradient:", gradient)
+	return lipgloss.JoinVertical(lipgloss.Left, header,
+		streams, "Latency Gradient:", gradient)
 }
 
-// Helper functions
-
-// latencyToGlyph converts latency to a colored glyph
-func (m model) latencyToGlyph(latency float64) string {
-	var glyph string
-	if math.IsNaN(latency) {
-		glyph = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000")).Render("x")
-	} else {
-		color := m.latencyToColor(latency)
-		glyph = lipgloss.NewStyle().Foreground(color).Render("█")
+func (m model) renderStream(data []float64) string {
+	glyphs := make([]string, len(data))
+	for i, lat := range data {
+		glyphs[i] = m.latencyToGlyph(lat)
 	}
-	return glyph
+	return lipgloss.JoinHorizontal(lipgloss.Top, glyphs...)
 }
 
-// aggregateToGlyph creates glyphs for aggregated data (mean, min, max)
-func (m model) aggregateToGlyph(data []float64) string {
-	min, max, sum, count := math.MaxFloat64, 0.0, 0.0, 0.0
-	for _, v := range data {
-		if !math.IsNaN(v) {
-			if v < min {
-				min = v
-			}
-			if v > max {
-				max = v
-			}
-			sum += v
-			count++
+func (m model) renderAggregateStream(size int) string {
+	length := len(m.stream1) / size
+	if length == 0 {
+		return ""
+	}
+	glyphLines := make([][]string, 3)
+	for i := 0; i < 3; i++ {
+		glyphLines[i] = make([]string, length)
+	}
+	for i := 0; i < length; i++ {
+		start := i * size
+		end := start + size
+		if end > len(m.stream1) {
+			end = len(m.stream1)
 		}
+		agg := m.stream1[start:end]
+		minLat, meanLat, maxLat := minMeanMax(agg)
+		glyphLines[0][i] = m.latencyToGlyph(maxLat)
+		glyphLines[1][i] = m.latencyToGlyph(meanLat)
+		glyphLines[2][i] = m.latencyToGlyph(minLat)
 	}
-	mean := sum / count
-
-	minGlyph := m.latencyToGlyph(min)
-	meanGlyph := m.latencyToGlyph(mean)
-	maxGlyph := m.latencyToGlyph(max)
-
-	return lipgloss.JoinHorizontal(lipgloss.Top, minGlyph, meanGlyph, maxGlyph)
+	lines := make([]string, 3)
+	for i := 0; i < 3; i++ {
+		lines[i] = lipgloss.JoinHorizontal(lipgloss.Top,
+			glyphLines[i]...)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
-// latencyToColor maps latency to a color gradient using logarithmic scaling
+func (m model) latencyToGlyph(latency float64) string {
+	if math.IsNaN(latency) {
+		return lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#800080")).Render("X")
+	}
+	color := m.latencyToColor(latency)
+	return lipgloss.NewStyle().Foreground(color).Render("█")
+}
+
 func (m model) latencyToColor(latency float64) lipgloss.Color {
-	// Handle initial cases
 	if m.minLat == m.maxLat {
-		return lipgloss.Color("#00FF00") // Green
+		return lipgloss.Color("#00FF00")
 	}
 
-	// Logarithmic scaling
 	minLog := math.Log10(m.minLat + 1)
 	maxLog := math.Log10(m.maxLat + 1)
 	latLog := math.Log10(latency + 1)
 	ratio := (latLog - minLog) / (maxLog - minLog)
+	ratio = math.Max(0, math.Min(1, ratio))
 
-	// Clamp ratio between 0 and 1
-	if ratio < 0 {
-		ratio = 0
+	var r, g, b int
+	switch {
+	case ratio < 0.25:
+		t := ratio / 0.25
+		r = int(0 * (1 - t))
+		g = int(0 * (1 - t))
+		b = int(255 * (1 - t) + 0*t)
+	case ratio < 0.5:
+		t := (ratio - 0.25) / 0.25
+		r = int(0 * t)
+		g = int(255 * t)
+		b = int(255 * (1 - t))
+	case ratio < 0.75:
+		t := (ratio - 0.5) / 0.25
+		r = int(255 * t)
+		g = 255
+		b = 0
+	default:
+		t := (ratio - 0.75) / 0.25
+		r = 255
+		g = int(255 * (1 - t))
+		b = 0
 	}
-	if ratio > 1 {
-		ratio = 1
-	}
-
-	// Interpolate color from green to red
-	r := int(255 * ratio)
-	g := int(255 * (1 - ratio))
-	return lipgloss.Color(fmt.Sprintf("#%02X%02X00", r, g))
+	return lipgloss.Color(fmt.Sprintf("#%02X%02X%02X", r, g, b))
 }
 
-// renderGlyphs joins glyphs into a string
-func (m model) renderGlyphs(glyphs []string) string {
-	return lipgloss.JoinHorizontal(lipgloss.Top, glyphs...)
-}
-
-// renderGradient displays the latency gradient scale
 func (m model) renderGradient() string {
 	gradient := ""
 	steps := 10
 	for i := 0; i <= steps; i++ {
 		ratio := float64(i) / float64(steps)
-		latency := math.Pow(10, ratio*(math.Log10(m.maxLat+1)-math.Log10(m.minLat+1))+math.Log10(m.minLat+1)) - 1
+		latency := math.Pow(10, ratio*(math.Log10(m.maxLat+1)-
+			math.Log10(m.minLat+1))+math.Log10(m.minLat+1)) - 1
 		color := m.latencyToColor(latency)
 		label := fmt.Sprintf("%.2f ms", latency)
-		gradient += lipgloss.NewStyle().Foreground(color).Render("█") + " " + label + "\n"
+		gradient += lipgloss.NewStyle().
+			Foreground(color).Render("█") + " " + label + "\n"
 	}
 	return gradient
+}
+
+func minMeanMax(data []float64) (float64, float64, float64) {
+	min := math.MaxFloat64
+	max := 0.0
+	sum := 0.0
+	count := 0.0
+	for _, v := range data {
+		if !math.IsNaN(v) {
+			min = math.Min(min, v)
+			max = math.Max(max, v)
+			sum += v
+			count++
+		}
+	}
+	if count == 0 {
+		return math.NaN(), math.NaN(), math.NaN()
+	}
+	return min, sum / count, max
 }
