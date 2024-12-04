@@ -44,17 +44,18 @@ func main() {
 }
 
 type model struct {
-	address         string
-	interval        time.Duration
-	initialized     bool
-	err             error
-	counter         int
-	latencyData     []float64
-	aggregateCounts []int
-	aggregateData   [][][]float64
-	windowWidth     int
-	minLatency      float64
-	maxLatency      float64
+	address            string
+	interval           time.Duration
+	initialized        bool
+	err                error
+	counter            int
+	latencyData        []float64
+	aggregateCounts    []int
+	aggregateData      [][][]float64
+	renderedAggregates []string
+	windowWidth        int
+	minLatency         float64
+	maxLatency         float64
 }
 
 func initialModel(address string, interval time.Duration, groupSize, aggregates int) model {
@@ -68,14 +69,16 @@ func initialModel(address string, interval time.Duration, groupSize, aggregates 
 		streamCount := 1 + int(math.Round(math.Log2(float64(aggregateCounts[i]))))
 		aggregateData[i] = make([][]float64, streamCount)
 	}
+	renderedAggregates := make([]string, aggregates)
 	return model{
-		initialized:     false,
-		aggregateCounts: aggregateCounts,
-		aggregateData:   aggregateData,
-		address:         address,
-		interval:        interval,
-		minLatency:      math.MaxFloat64,
-		maxLatency:      0.001,
+		initialized:        false,
+		aggregateCounts:    aggregateCounts,
+		aggregateData:      aggregateData,
+		renderedAggregates: renderedAggregates,
+		address:            address,
+		interval:           interval,
+		minLatency:         math.MaxFloat64,
+		maxLatency:         0.001,
 		// minLatency:  1,
 		// maxLatency:  10000,
 		windowWidth: 80,
@@ -145,7 +148,6 @@ func (m *model) processLatency(latency float64) {
 
 	m.latencyData = append(m.latencyData, latency)
 
-	// m.latencyData = m.latencyData[1:]
 	if len(m.latencyData) > m.windowWidth*65536 {
 		m.latencyData = m.latencyData[1:]
 	}
@@ -175,48 +177,52 @@ func (m *model) View() string {
 
 	header := fmt.Sprintf("Pinging %s every %v ms\n",
 		m.address, m.interval.Milliseconds())
-	gradient := m.renderLegend()
 
 	renderedStreams := lipgloss.JoinVertical(lipgloss.Left,
 		"Raw Data:", m.renderStream(m.getDisplayableStreamEnd(m.latencyData)),
 	)
 
 	for i, agg := range m.aggregateData {
-		renderedStreams = lipgloss.JoinVertical(lipgloss.Top, renderedStreams,
-			"Aggregated "+fmt.Sprint(m.aggregateCounts[i])+":",
-		)
+		renderedAggregate := "Aggregated " + fmt.Sprint(m.aggregateCounts[i]) + ":"
 		for j, data := range agg {
 			if j == len(agg)-1 {
 				glyphs := make([]string, len(data))
-				// anyDrop := false
+				anyDrop := false
 				for k, drops := range data {
 					if drops == 0 {
 						glyphs[k] = " "
-					} else if drops < 10 {
-						glyphs[k] = lipgloss.NewStyle().
-							Background(lipgloss.Color("#600060")).Render(fmt.Sprint(drops))
-						// anyDrop = true
 					} else {
-						character := mapToAlphabet((drops - 10) / (float64(m.aggregateCounts[i]) - 10))
+						character := " "
+						if drops < 10 {
+							character = fmt.Sprint(drops)
+						} else {
+							character = string(mapToAlphabet((drops - 10) / (float64(m.aggregateCounts[i]) - 10)))
+						}
 						glyphs[k] = lipgloss.NewStyle().
-							Background(lipgloss.Color("#600060")).Render(string(character))
-						// anyDrop = true
+							Background(lipgloss.Color("#600060")).Render(character)
+						anyDrop = true
 					}
 				}
-				// if anyDrop {
-				renderedStream := lipgloss.JoinHorizontal(lipgloss.Top, glyphs...)
-				renderedStreams = lipgloss.JoinVertical(lipgloss.Top, renderedStreams, renderedStream)
-				// }
+				if anyDrop {
+					renderedStream := lipgloss.JoinHorizontal(lipgloss.Top, glyphs...)
+					renderedAggregate = lipgloss.JoinVertical(
+						lipgloss.Top, renderedAggregate, renderedStream)
+				}
 			} else {
 				renderedStream := m.renderStream(m.getDisplayableStreamEnd(data))
-				renderedStreams = lipgloss.JoinVertical(lipgloss.Top, renderedStreams, renderedStream)
+				renderedAggregate = lipgloss.JoinVertical(
+					lipgloss.Top, renderedAggregate, renderedStream)
 			}
 		}
-
+		renderedStreams = lipgloss.JoinVertical(
+			lipgloss.Top, renderedStreams, renderedAggregate)
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left, header,
-		renderedStreams, "Latency Legend (ms):", gradient)
+	legend := lipgloss.JoinVertical(lipgloss.Top, "Latency Legend (ms):", m.renderLegend())
+
+	return lipgloss.JoinVertical(lipgloss.Top, header,
+		renderedStreams, legend)
+
 }
 
 func mapToAlphabet(value float64) rune {
@@ -251,19 +257,12 @@ func lerp(a, b, t float64) float64 {
 
 // Linear interpolation between two lipgloss.Color values
 func lerpColor(colorA, colorB lipgloss.Color, t float64) lipgloss.Color {
-	// doesn't work as expected for some reason:
-	// r1, g1, b1, _ := colorA.RGBA();
-	// r2, g2, b2, _ := colorB.RGBA();
+	r1, g1, b1, _ := colorA.RGBA()
+	r2, g2, b2, _ := colorB.RGBA()
 
-	var r1, g1, b1 int
-	var r2, g2, b2 int
-
-	fmt.Sscanf(string(colorA), "#%02x%02x%02x", &r1, &g1, &b1)
-	fmt.Sscanf(string(colorB), "#%02x%02x%02x", &r2, &g2, &b2)
-
-	r := int(lerp(float64(r1), float64(r2), t))
-	g := int(lerp(float64(g1), float64(g2), t))
-	b := int(lerp(float64(b1), float64(b2), t))
+	r := int(lerp(float64(r1/256), float64(r2/256), t))
+	g := int(lerp(float64(g1/256), float64(g2/256), t))
+	b := int(lerp(float64(b1/256), float64(b2/256), t))
 
 	return lipgloss.Color(fmt.Sprintf("#%02X%02X%02X", r, g, b))
 }
@@ -290,21 +289,6 @@ func (m *model) latencyToColor(latency float64) lipgloss.Color {
 
 	ratio := math.Log(latency/m.minLatency) / math.Log(m.maxLatency/m.minLatency)
 
-	// gradientColors := []lipgloss.Color{
-	// 	lipgloss.Color("#74D7FF"), // Bright cyan-blue
-	// 	lipgloss.Color("#80FF80"), // Bright green
-	// 	// lipgloss.Color("#E8FF80"), // Bright lime-green
-	// 	lipgloss.Color("#FFFF80"), // Bright yellow
-	// 	// lipgloss.Color("#FFCC80"), // Bright orange
-	// 	lipgloss.Color("#FF8080"), // Bright red
-
-	// 	// lipgloss.Color("#1C2E50"), // Dark cyan-blue
-	// 	// lipgloss.Color("#205020"), // Dark green
-	// 	// // lipgloss.Color("#4A5C20"), // Dark lime-green
-	// 	// lipgloss.Color("#665000"), // Dark yellow
-	// 	// lipgloss.Color("#663C20"), // Dark orange
-	// 	// lipgloss.Color("#500000"), // Dark red
-	// }
 	gradientHexcodes := []string{
 		// "#30123b",
 		"#466be3",
