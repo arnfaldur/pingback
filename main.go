@@ -13,12 +13,11 @@ import (
 	probing "github.com/prometheus-community/pro-bing"
 )
 
-const aggregateCount1 = 4
-const aggregateCount2 = aggregateCount1 * aggregateCount1
-
 func main() {
 	address := flag.String("address", "", "IP address or URL to ping")
-	interval := flag.Int("delay", 1000, "Delay between pings in milliseconds")
+	delay := flag.Int("delay", 1000, "Delay between pings in milliseconds")
+	groupSize := flag.Int("group", 32, "Number of samples to aggregate together")
+	aggregates := flag.Int("aggregates", 2, "Number of aggregate streams")
 	flag.Parse()
 
 	if *address == "" {
@@ -26,7 +25,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(initialModel(*address, time.Duration(*interval)*time.Millisecond))
+	model := initialModel(*address, time.Duration(*delay)*time.Millisecond, *groupSize, *aggregates)
+	p := tea.NewProgram(&model)
 
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error: %v\n", err)
@@ -35,39 +35,48 @@ func main() {
 }
 
 type model struct {
-	address       string
-	interval      time.Duration
-	err           error
-	counter       int64
-	latencyData   []float64
-	aggregateData [][][]float64
-	windowWidth   int
-	minLatency    float64
-	maxLatency    float64
+	address         string
+	interval        time.Duration
+	initialized     bool
+	err             error
+	counter         int
+	latencyData     []float64
+	aggregateCounts []int
+	aggregateData   [][][]float64
+	windowWidth     int
+	minLatency      float64
+	maxLatency      float64
 }
 
-func initialModel(address string, interval time.Duration) model {
-	aggregateData := make([][][]float64, 2)
+func initialModel(address string, interval time.Duration, groupSize, aggregates int) model {
+	aggregateCounts := make([]int, aggregates)
+	aggregateCounts[0] = groupSize
+	for i := range aggregateCounts[1:] {
+		aggregateCounts[i+1] = aggregateCounts[i] * groupSize
+	}
+	aggregateData := make([][][]float64, aggregates)
 	for i := range aggregateData {
-		aggregateData[i] = make([][]float64, 3)
+		aggregateData[i] = make([][]float64, 4)
 	}
 	return model{
-		aggregateData: aggregateData,
-		address:       address,
-		interval:      interval,
-		minLatency:    math.MaxFloat64,
-		maxLatency:    0.001,
+		initialized:     false,
+		aggregateCounts: aggregateCounts,
+		aggregateData:   aggregateData,
+		address:         address,
+		interval:        interval,
+		minLatency:      math.MaxFloat64,
+		maxLatency:      0.001,
 		// minLatency:  1,
 		// maxLatency:  10000,
 		windowWidth: 80,
 	}
 }
 
-func (m model) Init() tea.Cmd {
+func (m *model) Init() tea.Cmd {
 	return m.pingCmd()
 }
 
-func (m model) pingCmd() tea.Cmd {
+func (m *model) pingCmd() tea.Cmd {
 	return func() tea.Msg {
 		pinger, err := probing.NewPinger(m.address)
 		if err != nil {
@@ -82,6 +91,7 @@ func (m model) pingCmd() tea.Cmd {
 		stats := pinger.Statistics()
 		if len(stats.Rtts) > 0 {
 			latency := stats.Rtts[0].Seconds() * 1000
+			m.initialized = true
 			return latencyMsg{latency}
 		}
 		return latencyMsg{math.NaN()}
@@ -93,7 +103,7 @@ type (
 	errMsg     struct{ err error }
 )
 
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case latencyMsg:
 		m.processLatency(msg.latency)
@@ -130,83 +140,84 @@ func (m *model) processLatency(latency float64) {
 		m.latencyData = m.latencyData[1:]
 	}
 	m.counter += 1
-	if m.counter%aggregateCount1 == 0 && len(m.latencyData) > 0 {
-		// minimum, average, maximum := minAvgMax(m.latencyData[len(m.latencyData)-aggregateCount1:])
-		aggregate := minAvgMax(m.latencyData[len(m.latencyData)-aggregateCount1:])
-		for i := range m.aggregateData[0] {
-			m.aggregateData[0][i] = append(m.aggregateData[0][i], aggregate[i])
+	for i := range m.aggregateCounts {
+		if m.counter%m.aggregateCounts[i] == 0 && len(m.latencyData) > 0 {
+			aggregate := aggregate(m.latencyData[len(m.latencyData)-m.aggregateCounts[i]:])
+			for j := range m.aggregateData[i] {
+				m.aggregateData[i][j] = append(m.aggregateData[i][j], aggregate[j])
+			}
 		}
-		// m.aggregateData[0].maximum = append(m.aggregateData[0].maximum, maximum)
-		// m.aggregateData[0].average = append(m.aggregateData[0].average, average)
-		// m.aggregateData[0].minimum = append(m.aggregateData[0].minimum, minimum)
-		// l := m.latencyData[len(m.latencyData)-1]
-		// m.aggregateData[0] = append(m.aggregateData[0], aggregate{l, l, l})
-	}
 
-	if m.counter%aggregateCount2 == 0 && len(m.latencyData) > 0 {
-		aggregate := minAvgMax(m.latencyData[len(m.latencyData)-aggregateCount2:])
-		for i := range m.aggregateData[1] {
-			m.aggregateData[1][i] = append(m.aggregateData[1][i], aggregate[i])
-		}
-		// minimum, average, maximum := minAvgMax(m.latencyData[len(m.latencyData)-aggregateCount2:])
-		// m.aggregateData[1].maximum = append(m.aggregateData[1].maximum, maximum)
-		// m.aggregateData[1].average = append(m.aggregateData[1].average, average)
-		// m.aggregateData[1].minimum = append(m.aggregateData[1].minimum, minimum)
-		// l := m.latencyData[len(m.latencyData)-1]
-		// m.aggregateData[1] = append(m.aggregateData[1], aggregate{l, l, l})
-		m.counter -= aggregateCount2
 	}
 }
 
-func (m model) getDisplayableStreamEnd(stream []float64) []float64 {
+func (m *model) getDisplayableStreamEnd(stream []float64) []float64 {
 	return stream[max(0, len(stream)-m.windowWidth):]
 }
 
-func (m model) View() string {
+func (m *model) View() string {
 	if m.err != nil {
 		return fmt.Sprintf("Error: %v\n", m.err)
+	}
+	if !m.initialized {
+		return "Waiting for first reply"
 	}
 
 	header := fmt.Sprintf("Pinging %s every %v ms\n",
 		m.address, m.interval.Milliseconds())
 	gradient := m.renderLegend()
 
-	stream1 := m.renderStream(m.getDisplayableStreamEnd(m.latencyData))
-	aggregateDisplayable1 := make([]string, len(m.aggregateData[0]))
-	for i, data := range m.aggregateData[0] {
-		aggregateDisplayable1[i] = m.renderStream(m.getDisplayableStreamEnd(data))
-	}
-	stream2 := lipgloss.JoinVertical(lipgloss.Top,
-		aggregateDisplayable1...,
+	renderedStreams := lipgloss.JoinVertical(lipgloss.Left,
+		"Raw Data:", m.renderStream(m.getDisplayableStreamEnd(m.latencyData)),
 	)
-	// stream2 := lipgloss.JoinVertical(lipgloss.Top,
-	// 	m.renderStream(m.getDisplayableStreamEnd(m.aggregateData[0].maximum)),
-	// 	m.renderStream(m.getDisplayableStreamEnd(m.aggregateData[0].average)),
-	// 	m.renderStream(m.getDisplayableStreamEnd(m.aggregateData[0].minimum)))
 
-	aggregateDisplayable2 := make([]string, len(m.aggregateData[1]))
-	for i, data := range m.aggregateData[1] {
-		aggregateDisplayable2[i] = m.renderStream(m.getDisplayableStreamEnd(data))
-	}
-	stream3 := lipgloss.JoinVertical(lipgloss.Top,
-		aggregateDisplayable2...,
-	)
-	// stream3 := lipgloss.JoinVertical(lipgloss.Top,
-	// 	m.renderStream(m.getDisplayableStreamEnd(m.aggregateData[1].maximum)),
-	// 	m.renderStream(m.getDisplayableStreamEnd(m.aggregateData[1].average)),
-	// 	m.renderStream(m.getDisplayableStreamEnd(m.aggregateData[1].minimum)))
+	for i, agg := range m.aggregateData {
+		renderedStreams = lipgloss.JoinVertical(lipgloss.Top, renderedStreams,
+			"Aggregated "+fmt.Sprint(m.aggregateCounts[i])+":",
+		)
+		for j, data := range agg {
+			if j == 0 {
+				glyphs := make([]string, len(data))
+				// anyDrop := false
+				for k, drops := range data {
+					if drops == 0 {
+						glyphs[k] = " "
+					} else if drops < 10 {
+						glyphs[k] = lipgloss.NewStyle().
+							Background(lipgloss.Color("#600060")).Render(fmt.Sprint(drops))
+						// anyDrop = true
+					} else {
+						character := mapToAlphabet((drops - 10) / (float64(m.aggregateCounts[i]) - 10))
+						glyphs[k] = lipgloss.NewStyle().
+							Background(lipgloss.Color("#600060")).Render(string(character))
+						// anyDrop = true
+					}
+				}
+				// if anyDrop {
+					renderedStream := lipgloss.JoinHorizontal(lipgloss.Top, glyphs...)
+					renderedStreams = lipgloss.JoinVertical(lipgloss.Top, renderedStreams, renderedStream)
+				// }
+			} else {
+				renderedStream := m.renderStream(m.getDisplayableStreamEnd(data))
+				renderedStreams = lipgloss.JoinVertical(lipgloss.Top, renderedStreams, renderedStream)
+			}
+		}
 
-	streams := lipgloss.JoinVertical(lipgloss.Left,
-		"Stream 1 (Raw Data):", stream1,
-		"Stream 2 (Aggregated "+fmt.Sprint(aggregateCount1)+"):", stream2,
-		"Stream 3 (Aggregated "+fmt.Sprint(aggregateCount2)+"):", stream3,
-	)
+	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, header,
-		streams, "Latency Gradient (ms):", gradient)
+		renderedStreams, "Latency Legend (ms):", gradient)
 }
 
-func (m model) renderStream(data []float64) string {
+func mapToAlphabet(value float64) rune {
+	if value < 0 {
+		value = 0
+	} else if value > 1 {
+		value = 1
+	}
+	return rune('a' + int(value*25)) // 25 = number of steps between 'a' and 'z'
+}
+func (m *model) renderStream(data []float64) string {
 	glyphs := make([]string, len(data))
 	for i, lat := range data {
 		glyphs[i] = m.latencyToGlyph(lat)
@@ -214,7 +225,7 @@ func (m model) renderStream(data []float64) string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, glyphs...)
 }
 
-func (m model) latencyToGlyph(latency float64) string {
+func (m *model) latencyToGlyph(latency float64) string {
 	if math.IsNaN(latency) {
 		return lipgloss.NewStyle().
 			Background(lipgloss.Color("#600060")).Render("X")
@@ -262,28 +273,12 @@ func getGradientColor(colors []lipgloss.Color, ratio float64) lipgloss.Color {
 }
 
 // Updated latencyToColor function
-func (m model) latencyToColor(latency float64) lipgloss.Color {
+func (m *model) latencyToColor(latency float64) lipgloss.Color {
 	if m.minLatency == m.maxLatency {
 		return lipgloss.Color("#00FF00") // Default to green
 	}
 
-	// minLog := math.Log10(m.minLatency)
-	// maxLog := math.Log10(m.maxLatency)
-	// latLog := math.Log10(latency)
-	// ratio := (latLog - minLog) / (maxLog - minLog)
-	// ratio = math.Max(0, math.Min(1, ratio))
 	ratio := math.Log(latency/m.minLatency) / math.Log(m.maxLatency/m.minLatency)
-
-	// Define your gradient colors
-	// gradientColors := []lipgloss.Color{
-	// 	lipgloss.Color("#42A5F5"), // Soft blue
-	// 	lipgloss.Color("#4CAF50"), // Muted green
-	// 	lipgloss.Color("#A2D94A"), // Lime green
-	// 	lipgloss.Color("#FFD700"), // Golden yellow
-	// 	lipgloss.Color("#FFA500"), // Orange
-	// 	lipgloss.Color("#FF4500"), // Orange-red
-	// 	lipgloss.Color("#C42020"), // Deep red
-	// }
 
 	gradientColors := []lipgloss.Color{
 		lipgloss.Color("#74D7FF"), // Bright cyan-blue
@@ -304,7 +299,7 @@ func (m model) latencyToColor(latency float64) lipgloss.Color {
 	return getGradientColor(gradientColors, ratio)
 }
 
-func (m model) renderLegend() string {
+func (m *model) renderLegend() string {
 	// Number of gradient steps
 	steps := 90 - 1
 	// Collect legend entries
@@ -354,27 +349,34 @@ func (m model) renderLegend() string {
 	// Join rows into a table
 	rowsJoined := make([]string, len(grid))
 	for i, row := range grid {
-		rowsJoined[i] = lipgloss.JoinVertical(lipgloss.Left, row...)
+		rowsJoined[i] = lipgloss.JoinVertical(lipgloss.Top, row...)
 	}
 
 	return lipgloss.JoinHorizontal(lipgloss.Left, rowsJoined...)
 }
 
-func minAvgMax(data []float64) [3]float64 {
+func aggregate(data []float64) []float64 {
 	min := math.MaxFloat64
 	max := 0.0
 	sum := 0.0
 	count := 0.0
+	lost := 0.
 	for _, v := range data {
 		if !math.IsNaN(v) {
 			min = math.Min(min, v)
 			max = math.Max(max, v)
 			sum += v
 			count++
+		} else {
+			lost++
 		}
 	}
+	result := make([]float64, 0)
+	result = append(result, lost)
 	if count == 0 {
-		return [...]float64{math.NaN(), math.NaN(), math.NaN()}
+		result = append(result, math.NaN(), math.NaN(), math.NaN())
+	} else {
+		result = append(result, min, sum/count, max)
 	}
-	return [...]float64{min, sum / count, max}
+	return result
 }
