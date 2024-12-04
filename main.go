@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -24,6 +25,14 @@ func main() {
 		fmt.Println("Usage: pingback -address=<IP_or_URL> [-delay=<milliseconds>]")
 		os.Exit(1)
 	}
+	// if len(os.Getenv("DEBUG")) > 0 {
+	// f, err := tea.LogToFile("debug.log", "debug")
+	// if err != nil {
+	// 	fmt.Println("fatal:", err)
+	// 	os.Exit(1)
+	// }
+	// defer f.Close()
+	// }
 
 	model := initialModel(*address, time.Duration(*delay)*time.Millisecond, *groupSize, *aggregates)
 	p := tea.NewProgram(&model)
@@ -56,7 +65,8 @@ func initialModel(address string, interval time.Duration, groupSize, aggregates 
 	}
 	aggregateData := make([][][]float64, aggregates)
 	for i := range aggregateData {
-		aggregateData[i] = make([][]float64, 4)
+		streamCount := 1 + int(math.Round(math.Log2(float64(aggregateCounts[i]))))
+		aggregateData[i] = make([][]float64, streamCount)
 	}
 	return model{
 		initialized:     false,
@@ -176,7 +186,7 @@ func (m *model) View() string {
 			"Aggregated "+fmt.Sprint(m.aggregateCounts[i])+":",
 		)
 		for j, data := range agg {
-			if j == 0 {
+			if j == len(agg)-1 {
 				glyphs := make([]string, len(data))
 				// anyDrop := false
 				for k, drops := range data {
@@ -194,8 +204,8 @@ func (m *model) View() string {
 					}
 				}
 				// if anyDrop {
-					renderedStream := lipgloss.JoinHorizontal(lipgloss.Top, glyphs...)
-					renderedStreams = lipgloss.JoinVertical(lipgloss.Top, renderedStreams, renderedStream)
+				renderedStream := lipgloss.JoinHorizontal(lipgloss.Top, glyphs...)
+				renderedStreams = lipgloss.JoinVertical(lipgloss.Top, renderedStreams, renderedStream)
 				// }
 			} else {
 				renderedStream := m.renderStream(m.getDisplayableStreamEnd(data))
@@ -280,20 +290,35 @@ func (m *model) latencyToColor(latency float64) lipgloss.Color {
 
 	ratio := math.Log(latency/m.minLatency) / math.Log(m.maxLatency/m.minLatency)
 
-	gradientColors := []lipgloss.Color{
-		lipgloss.Color("#74D7FF"), // Bright cyan-blue
-		lipgloss.Color("#80FF80"), // Bright green
-		// lipgloss.Color("#E8FF80"), // Bright lime-green
-		lipgloss.Color("#FFFF80"), // Bright yellow
-		// lipgloss.Color("#FFCC80"), // Bright orange
-		lipgloss.Color("#FF8080"), // Bright red
+	// gradientColors := []lipgloss.Color{
+	// 	lipgloss.Color("#74D7FF"), // Bright cyan-blue
+	// 	lipgloss.Color("#80FF80"), // Bright green
+	// 	// lipgloss.Color("#E8FF80"), // Bright lime-green
+	// 	lipgloss.Color("#FFFF80"), // Bright yellow
+	// 	// lipgloss.Color("#FFCC80"), // Bright orange
+	// 	lipgloss.Color("#FF8080"), // Bright red
 
-		// lipgloss.Color("#1C2E50"), // Dark cyan-blue
-		// lipgloss.Color("#205020"), // Dark green
-		// // lipgloss.Color("#4A5C20"), // Dark lime-green
-		// lipgloss.Color("#665000"), // Dark yellow
-		// lipgloss.Color("#663C20"), // Dark orange
-		// lipgloss.Color("#500000"), // Dark red
+	// 	// lipgloss.Color("#1C2E50"), // Dark cyan-blue
+	// 	// lipgloss.Color("#205020"), // Dark green
+	// 	// // lipgloss.Color("#4A5C20"), // Dark lime-green
+	// 	// lipgloss.Color("#665000"), // Dark yellow
+	// 	// lipgloss.Color("#663C20"), // Dark orange
+	// 	// lipgloss.Color("#500000"), // Dark red
+	// }
+	gradientHexcodes := []string{
+		// "#30123b",
+		"#466be3",
+		"#29bbec",
+		"#31f199",
+		"#a3fd3d",
+		"#edd03a",
+		"#fb8022",
+		"#d23105",
+		"#7a0403",
+	}
+	gradientColors := make([]lipgloss.Color, len(gradientHexcodes))
+	for i, hexcode := range gradientHexcodes {
+		gradientColors[i] = lipgloss.Color(hexcode)
 	}
 
 	return getGradientColor(gradientColors, ratio)
@@ -356,27 +381,48 @@ func (m *model) renderLegend() string {
 }
 
 func aggregate(data []float64) []float64 {
-	min := math.MaxFloat64
-	max := 0.0
-	sum := 0.0
-	count := 0.0
-	lost := 0.
-	for _, v := range data {
-		if !math.IsNaN(v) {
-			min = math.Min(min, v)
-			max = math.Max(max, v)
-			sum += v
-			count++
-		} else {
+	innerData := make([]float64, len(data))
+	copy(innerData, data)
+	lost := 0
+	sort.Float64s(innerData)
+	for _, v := range innerData {
+		if math.IsNaN(v) {
 			lost++
 		}
 	}
+	innerData = append(innerData[lost:], innerData[:lost]...)
 	result := make([]float64, 0)
-	result = append(result, lost)
-	if count == 0 {
-		result = append(result, math.NaN(), math.NaN(), math.NaN())
-	} else {
-		result = append(result, min, sum/count, max)
+	samples := math.Log2(float64(len(innerData)))
+	for i := 0; i < int(samples); i++ {
+		index := (int(math.Round(float64(i) / ((samples - 1) / (float64(len(innerData)) - 1)))))
+		result = append(result, innerData[index])
 	}
+	result = append(result, float64(lost))
 	return result
 }
+
+// func aggregate(data []float64) []float64 {
+// 	min := math.MaxFloat64
+// 	max := 0.0
+// 	sum := 0.0
+// 	count := 0.0
+// 	lost := 0.
+// 	for _, v := range data {
+// 		if !math.IsNaN(v) {
+// 			min = math.Min(min, v)
+// 			max = math.Max(max, v)
+// 			sum += v
+// 			count++
+// 		} else {
+// 			lost++
+// 		}
+// 	}
+// 	result := make([]float64, 0)
+// 	result = append(result, lost)
+// 	if count == 0 {
+// 		result = append(result, math.NaN(), math.NaN(), math.NaN())
+// 	} else {
+// 		result = append(result, min, sum/count, max)
+// 	}
+// 	return result
+// }
