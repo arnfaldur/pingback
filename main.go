@@ -53,6 +53,8 @@ type model struct {
 	aggregateCounts    []int
 	aggregateData      [][][]float64
 	renderedAggregates []string
+	renderedLegend     string
+	gradientUpdate     bool
 	windowWidth        int
 	minLatency         float64
 	maxLatency         float64
@@ -75,10 +77,12 @@ func initialModel(address string, interval time.Duration, groupSize, aggregates 
 		aggregateCounts:    aggregateCounts,
 		aggregateData:      aggregateData,
 		renderedAggregates: renderedAggregates,
+		renderedLegend:     "",
 		address:            address,
 		interval:           interval,
 		minLatency:         math.MaxFloat64,
 		maxLatency:         0.001,
+		gradientUpdate:     true,
 		// minLatency:  1,
 		// maxLatency:  10000,
 		windowWidth: 80,
@@ -140,9 +144,11 @@ func (m *model) processLatency(latency float64) {
 	if !math.IsNaN(latency) {
 		if latency < m.minLatency {
 			m.minLatency = latency
+			m.gradientUpdate = true
 		}
 		if latency > m.maxLatency {
 			m.maxLatency = latency
+			m.gradientUpdate = true
 		}
 	}
 
@@ -183,9 +189,14 @@ func (m *model) View() string {
 	)
 
 	for i, agg := range m.aggregateData {
+		if m.counter%m.aggregateCounts[i] != 0 && !m.gradientUpdate {
+			continue
+		}
+
 		renderedAggregate := "Aggregated " + fmt.Sprint(m.aggregateCounts[i]) + ":"
 		for j, data := range agg {
 			if j == len(agg)-1 {
+				data = m.getDisplayableStreamEnd(data)
 				glyphs := make([]string, len(data))
 				anyDrop := false
 				for k, drops := range data {
@@ -214,14 +225,20 @@ func (m *model) View() string {
 					lipgloss.Top, renderedAggregate, renderedStream)
 			}
 		}
+		m.renderedAggregates[i] = renderedAggregate
+	}
+	for _, agg := range m.renderedAggregates {
 		renderedStreams = lipgloss.JoinVertical(
-			lipgloss.Top, renderedStreams, renderedAggregate)
+			lipgloss.Top, renderedStreams, agg)
 	}
 
-	legend := lipgloss.JoinVertical(lipgloss.Top, "Latency Legend (ms):", m.renderLegend())
+	if m.gradientUpdate {
+		m.renderedLegend = lipgloss.JoinVertical(lipgloss.Top, "Latency Legend (ms):", m.renderLegend())
+		m.gradientUpdate = false
+	}
 
 	return lipgloss.JoinVertical(lipgloss.Top, header,
-		renderedStreams, legend)
+		renderedStreams, m.renderedLegend)
 
 }
 
