@@ -36,17 +36,18 @@ type model struct {
 	err          error
 	latencyData  []float64
 	streamLength int
-	stream1      []float64
-	minLat       float64
-	maxLat       float64
+	minLatency   float64
+	maxLatency   float64
 }
 
 func initialModel(address string, interval time.Duration) model {
 	return model{
-		address:      address,
-		interval:     interval,
-		minLat:       math.MaxFloat64,
-		maxLat:       0,
+		address:  address,
+		interval: interval,
+		// minLatency:   math.MaxFloat64,
+		// maxLatency:   0,
+		minLatency:   1,
+		maxLatency:   10000,
 		streamLength: 80,
 	}
 }
@@ -106,22 +107,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *model) processLatency(latency float64) {
 	if !math.IsNaN(latency) {
-		if latency < m.minLat {
-			m.minLat = latency
+		if latency < m.minLatency {
+			m.minLatency = latency
 		}
-		if latency > m.maxLat {
-			m.maxLat = latency
+		if latency > m.maxLatency {
+			m.maxLatency = latency
 		}
 	}
 
 	m.latencyData = append(m.latencyData, latency)
 	if len(m.latencyData) > m.streamLength {
 		m.latencyData = m.latencyData[1:]
-	}
-
-	m.stream1 = append(m.stream1, latency)
-	if len(m.stream1) > m.streamLength {
-		m.stream1 = m.stream1[1:]
 	}
 }
 
@@ -134,7 +130,7 @@ func (m model) View() string {
 		m.address, m.interval.Milliseconds())
 	gradient := m.renderGradient()
 
-	stream1 := m.renderStream(m.stream1)
+	stream1 := m.renderStream(m.latencyData)
 	stream2 := m.renderAggregateStream(32)
 	stream3 := m.renderAggregateStream(1024)
 
@@ -157,7 +153,7 @@ func (m model) renderStream(data []float64) string {
 }
 
 func (m model) renderAggregateStream(size int) string {
-	length := len(m.stream1) / size
+	length := len(m.latencyData) / size
 	if length == 0 {
 		return ""
 	}
@@ -168,10 +164,10 @@ func (m model) renderAggregateStream(size int) string {
 	for i := 0; i < length; i++ {
 		start := i * size
 		end := start + size
-		if end > len(m.stream1) {
-			end = len(m.stream1)
+		if end > len(m.latencyData) {
+			end = len(m.latencyData)
 		}
-		agg := m.stream1[start:end]
+		agg := m.latencyData[start:end]
 		minLat, meanLat, maxLat := minMeanMax(agg)
 		glyphLines[0][i] = m.latencyToGlyph(maxLat)
 		glyphLines[1][i] = m.latencyToGlyph(meanLat)
@@ -194,50 +190,101 @@ func (m model) latencyToGlyph(latency float64) string {
 	return lipgloss.NewStyle().Foreground(color).Render("█")
 }
 
+// Linear interpolation between two float64 values
+func lerp(a, b, t float64) float64 {
+	return a + t*(b-a)
+}
+
+// Linear interpolation between two lipgloss.Color values
+func lerpColor(colorA, colorB lipgloss.Color, t float64) lipgloss.Color {
+	// doesn't work for some reason:
+	// r1, g1, b1, _ := colorA.RGBA();
+	// r2, g2, b2, _ := colorB.RGBA();
+
+	var r1, g1, b1 int
+	var r2, g2, b2 int
+
+	fmt.Sscanf(string(colorA), "#%02x%02x%02x", &r1, &g1, &b1)
+	fmt.Sscanf(string(colorB), "#%02x%02x%02x", &r2, &g2, &b2)
+
+	r := int(lerp(float64(r1), float64(r2), t))
+	g := int(lerp(float64(g1), float64(g2), t))
+	b := int(lerp(float64(b1), float64(b2), t))
+
+	return lipgloss.Color(fmt.Sprintf("#%02X%02X%02X", r, g, b))
+}
+
+// Get gradient color based on ratio
+func getGradientColor(colors []lipgloss.Color, ratio float64) lipgloss.Color {
+	if ratio <= 0 {
+		return colors[0]
+	}
+	if ratio >= 1 {
+		return colors[len(colors)-1]
+	}
+	scaledRatio := ratio * float64(len(colors)-1)
+	index := int(scaledRatio)
+	t := scaledRatio - float64(index)
+	return lerpColor(colors[index], colors[index+1], t)
+}
+
+// Updated latencyToColor function
 func (m model) latencyToColor(latency float64) lipgloss.Color {
-	if m.minLat == m.maxLat {
-		return lipgloss.Color("#00FF00")
+	if m.minLatency == m.maxLatency {
+		return lipgloss.Color("#00FF00") // Default to green
 	}
 
-	minLog := math.Log10(m.minLat + 1)
-	maxLog := math.Log10(m.maxLat + 1)
+	minLog := math.Log10(m.minLatency + 1)
+	maxLog := math.Log10(m.maxLatency + 1)
 	latLog := math.Log10(latency + 1)
 	ratio := (latLog - minLog) / (maxLog - minLog)
 	ratio = math.Max(0, math.Min(1, ratio))
 
-	var r, g, b int
-	switch {
-	case ratio < 0.25:
-		t := ratio / 0.25
-		r = int(0 * (1 - t))
-		g = int(0 * (1 - t))
-		b = int(255 * (1 - t) + 0*t)
-	case ratio < 0.5:
-		t := (ratio - 0.25) / 0.25
-		r = int(0 * t)
-		g = int(255 * t)
-		b = int(255 * (1 - t))
-	case ratio < 0.75:
-		t := (ratio - 0.5) / 0.25
-		r = int(255 * t)
-		g = 255
-		b = 0
-	default:
-		t := (ratio - 0.75) / 0.25
-		r = 255
-		g = int(255 * (1 - t))
-		b = 0
+	// Define your gradient colors
+	// gradientColors := []lipgloss.Color{
+	// 	lipgloss.Color("#42A5F5"), // Soft blue
+	// 	lipgloss.Color("#4CAF50"), // Muted green
+	// 	lipgloss.Color("#A2D94A"), // Lime green
+	// 	lipgloss.Color("#FFD700"), // Golden yellow
+	// 	lipgloss.Color("#FFA500"), // Orange
+	// 	lipgloss.Color("#FF4500"), // Orange-red
+	// 	lipgloss.Color("#C42020"), // Deep red
+	// }
+
+	gradientColors := []lipgloss.Color{
+		lipgloss.Color("#74D7FF"), // Bright cyan-blue
+		lipgloss.Color("#80FF80"), // Bright green
+		// lipgloss.Color("#E8FF80"), // Bright lime-green
+		lipgloss.Color("#FFFF80"), // Bright yellow
+		// lipgloss.Color("#FFCC80"), // Bright orange
+		lipgloss.Color("#FF8080"), // Bright red
+
+		lipgloss.Color("#1C2E50"), // Dark cyan-blue
+		lipgloss.Color("#205020"), // Dark green
+		// lipgloss.Color("#4A5C20"), // Dark lime-green
+		lipgloss.Color("#665000"), // Dark yellow
+		lipgloss.Color("#663C20"), // Dark orange
+		lipgloss.Color("#500000"), // Dark red
 	}
-	return lipgloss.Color(fmt.Sprintf("#%02X%02X%02X", r, g, b))
+
+	// gradientColors := []lipgloss.Color{
+	//     // lipgloss.Color("#00FFFF"), // Blue
+	//     lipgloss.Color("#00FF00"), // Green
+	//     lipgloss.Color("#FFFF00"), // Yellow
+	//     lipgloss.Color("#FF0000"), // Red
+	// }
+
+	return getGradientColor(gradientColors, ratio)
 }
 
 func (m model) renderGradient() string {
 	gradient := ""
-	steps := 10
+	steps := 9 - 1
 	for i := 0; i <= steps; i++ {
 		ratio := float64(i) / float64(steps)
-		latency := math.Pow(10, ratio*(math.Log10(m.maxLat+1)-
-			math.Log10(m.minLat+1))+math.Log10(m.minLat+1)) - 1
+		latency := math.Pow(10, ratio*(math.Log10(m.maxLatency)-
+			math.Log10(m.minLatency))+
+			math.Log10(m.minLatency))
 		color := m.latencyToColor(latency)
 		label := fmt.Sprintf("%.2f ms", latency)
 		gradient += lipgloss.NewStyle().
