@@ -22,7 +22,7 @@ func main() {
 	flag.Parse()
 
 	if *address == "" {
-		fmt.Println("Usage: pingback -address=<IP_or_URL> [-delay=<milliseconds>]")
+		fmt.Println("Usage: pingback -address=<IP_or_URL> [-delay=<milliseconds>] [-group=<groupSize>] [-aggregates=<number>]")
 		os.Exit(1)
 	}
 	// if len(os.Getenv("DEBUG")) > 0 {
